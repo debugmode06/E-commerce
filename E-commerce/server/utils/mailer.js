@@ -1,55 +1,43 @@
 // server/utils/mailer.js
 require('dotenv').config();
+const { Resend } = require('resend');
 const nodemailer = require('nodemailer');
 
-let transporter;
+// ── Resend client (production) ──────────────────────────────────────────────
+let resend;
+function getResend() {
+  if (!resend) resend = new Resend(process.env.RESEND_API_KEY);
+  return resend;
+}
 
+// ── Nodemailer fallback (local dev with Gmail) ──────────────────────────────
+let transporter;
 function getTransporter() {
   if (transporter) return transporter;
-
-  const isProduction = process.env.NODE_ENV === 'production';
-
-  if (process.env.MAIL_SERVICE === 'gmail') {
-    transporter = nodemailer.createTransport({
-      service: 'gmail',
-      auth: {
-        user: process.env.MAIL_USER,
-        pass: process.env.MAIL_PASS,
-      },
-      // Timeouts to handle Render cold starts & slow cloud connections
-      connectionTimeout: 10000,  // 10s to establish connection
-      greetingTimeout:   10000,  // 10s for SMTP greeting
-      socketTimeout:     15000,  // 15s for socket inactivity
-      pool: false,               // Don't pool for serverless-like environments
-      logger: !isProduction,     // Log SMTP traffic in dev
-      debug:  !isProduction,
-    });
-  } else {
-    transporter = nodemailer.createTransport({
-      host:   process.env.SMTP_HOST,
-      port:   Number(process.env.SMTP_PORT) || 587,
-      secure: Number(process.env.SMTP_PORT) === 465,
-      auth: {
-        user: process.env.SMTP_USER,
-        pass: process.env.SMTP_PASS,
-      },
-      connectionTimeout: 10000,
-      greetingTimeout:   10000,
-      socketTimeout:     15000,
-    });
-  }
-
+  transporter = nodemailer.createTransport({
+    service: 'gmail',
+    auth: {
+      user: process.env.MAIL_USER,
+      pass: process.env.MAIL_PASS,
+    },
+    connectionTimeout: 10000,
+    greetingTimeout:   10000,
+    socketTimeout:     15000,
+  });
   return transporter;
 }
 
+// ── Decide which provider to use ────────────────────────────────────────────
+// Use Resend if RESEND_API_KEY is set, otherwise fall back to Gmail/SMTP
+function useResend() {
+  return !!process.env.RESEND_API_KEY;
+}
+
 /**
- * Send OTP email to user
- * @param {string} to    - recipient email
- * @param {string} name  - recipient name
- * @param {string} otp   - 6-digit OTP string
+ * Build the OTP email HTML
  */
-async function sendOtpEmail(to, name, otp) {
-  const html = `
+function buildOtpHtml(name, otp) {
+  return `
 <!DOCTYPE html>
 <html>
 <head>
@@ -128,25 +116,58 @@ async function sendOtpEmail(to, name, otp) {
   </table>
 </body>
 </html>`;
+}
 
+/**
+ * Send OTP email to user
+ * @param {string} to    - recipient email
+ * @param {string} name  - recipient name
+ * @param {string} otp   - 6-digit OTP string
+ */
+async function sendOtpEmail(to, name, otp) {
+  const html = buildOtpHtml(name, otp);
   const text = `Hi ${name},\n\nYour OTP for The Anjaraipetti is: ${otp}\n\nThis code expires in 10 minutes.\nDo not share this with anyone.\n\n– The Anjaraipetti Team`;
+  const subject = `${otp} is your The Anjaraipetti login code`;
+  const from = process.env.MAIL_FROM || 'The Anjaraipetti <onboarding@resend.dev>';
 
   try {
-    const info = await getTransporter().sendMail({
-      from:    process.env.MAIL_FROM || 'The Anjaraipetti <noreply@theanjaraipetti.com>',
-      to,
-      subject: `${otp} is your The Anjaraipetti login code`,
-      text,
-      html,
-    });
-    console.log(`✅ OTP Email sent to ${to}: ${info.messageId}`);
-    return info;
+    if (useResend()) {
+      // ── Resend (production / cloud) ─────────────────────────────────
+      const { data, error } = await getResend().emails.send({
+        from,
+        to: [to],
+        subject,
+        html,
+        text,
+      });
+
+      if (error) {
+        console.error('❌ Resend API Error:', error);
+        throw new Error(error.message || 'Resend API returned an error');
+      }
+
+      console.log(`✅ OTP Email sent via Resend to ${to}: ${data?.id}`);
+      return data;
+
+    } else {
+      // ── Nodemailer / Gmail fallback (local dev) ─────────────────────
+      const info = await getTransporter().sendMail({
+        from,
+        to,
+        subject,
+        text,
+        html,
+      });
+      console.log(`✅ OTP Email sent via Gmail to ${to}: ${info.messageId}`);
+      return info;
+    }
+
   } catch (err) {
     console.error('❌ CRITICAL MAIL FAILURE:', {
+      provider: useResend() ? 'Resend' : 'Gmail/SMTP',
       message: err.message,
       code: err.code,
-      command: err.command,
-      stack: err.stack
+      statusCode: err.statusCode,
     });
     throw err;
   }
